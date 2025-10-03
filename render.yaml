@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: mashrou3-bot
+    env: python
+    plan: free
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    autoDeploy: false
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.14
+      - key: DECISION_EVERY_S
+        value: 30
+      - key: KEEPALIVE_SECONDS
+        value: 50

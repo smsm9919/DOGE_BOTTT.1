@@ -11,8 +11,8 @@ RF Futures Bot — Smart Pro (BingX Perp, CCXT)
 
 Patched:
 - BingX position mode support (oneway|hedge) with correct positionSide
-- Safe state updates (don't flip local state on failed open)
-- Logs: show WAIT reason + time left to candle close
+- Safe state updates (no local open if exchange order failed)
+- Rich logs: candles/regime/bias/ATR%, WAIT reason, and time left to candle close
 """
 
 import os, time, math, threading, requests, traceback, random
@@ -77,12 +77,8 @@ SELF_URL = getenv("SELF_URL", "") or getenv("RENDER_EXTERNAL_URL","")
 KEEPALIVE_SECONDS = getenv("KEEPALIVE_SECONDS", 50, int)
 PORT     = getenv("PORT", 5000, int)
 
-# ---- NEW: BingX position mode support ----
+# ---- BingX position mode support ----
 BINGX_POSITION_MODE = getenv("BINGX_POSITION_MODE", "oneway").lower()  # oneway | hedge
-
-# ---- Optional: entry confirmation knobs (kept for future use, default off) ----
-ENTRY_CONFIRM_SEC    = getenv("ENTRY_CONFIRM_SEC", 0, int)   # 0 = disabled
-ENTRY_CONFIRM_STRICT = getenv("ENTRY_CONFIRM_STRICT", True, bool)
 
 print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'} • SYMBOL={SYMBOL} • {INTERVAL}", "yellow"))
 print(colored(f"STRATEGY: {STRATEGY.upper()} • SMART_EXIT={'ON' if USE_SMART_EXIT else 'OFF'}", "yellow"))
@@ -149,7 +145,7 @@ def orderbook_spread_bps():
     except Exception:
         return None
 
-# ---- NEW: time to candle close helpers ----
+# ---- time to candle close ----
 def _interval_seconds(iv: str) -> int:
     iv = (iv or "").lower().strip()
     if iv.endswith("m"): return int(float(iv[:-1]))*60
@@ -160,8 +156,7 @@ def _interval_seconds(iv: str) -> int:
 def time_to_candle_close(df: pd.DataFrame, use_tv_bar: bool) -> int:
     tf = _interval_seconds(INTERVAL)
     if len(df) == 0: return tf
-    # معظم المنصات تعطي time كبداية الشمعة بالـ ms
-    cur_start_ms = int(df["time"].iloc[-1])
+    cur_start_ms = int(df["time"].iloc[-1])  # start time (ms) for current bar
     now_ms = int(time.time()*1000)
     next_close_ms = cur_start_ms + tf*1000
     while next_close_ms <= now_ms:
@@ -195,6 +190,71 @@ def compute_indicators(df: pd.DataFrame):
         "rsi": float(rsi.iloc[i]), "plus_di": float(plus_di.iloc[i]),
         "minus_di": float(minus_di.iloc[i]), "dx": float(dx.iloc[i]),
         "adx": float(adx.iloc[i]), "atr": float(atr.iloc[i])
+    }
+
+# ------------ Candle analytics (logging only) ------------
+def _candle_stats(o, c, h, l):
+    rng = max(h - l, 1e-12)
+    body = abs(c - o)
+    upper = h - max(o, c)
+    lower = min(o, c) - l
+    return {
+        "range": rng,
+        "body": body,
+        "body_pct": (body / rng) * 100.0,
+        "upper_pct": (upper / rng) * 100.0,
+        "lower_pct": (lower / rng) * 100.0,
+        "bull": c > o,
+        "bear": c < o
+    }
+
+def detect_candle_pattern(df: pd.DataFrame):
+    if len(df) < 2:
+        return "NONE"
+    idx = -1 if USE_TV_BAR else -2
+    o1, h1, l1, c1 = map(float, (df["open"].iloc[idx], df["high"].iloc[idx], df["low"].iloc[idx], df["close"].iloc[idx]))
+    o0, h0, l0, c0 = map(float, (df["open"].iloc[idx-1], df["high"].iloc[idx-1], df["low"].iloc[idx-1], df["close"].iloc[idx-1]))
+    s1 = _candle_stats(o1, c1, h1, l1)
+    s0 = _candle_stats(o0, c0, h0, l0)
+
+    if s1["body_pct"] <= 12: return "DOJI"
+    if s1["bull"] and s1["lower_pct"] >= 55 and s1["upper_pct"] <= 20: return "PIN_BULL"
+    if s1["bear"] and s1["upper_pct"] >= 55 and s1["lower_pct"] <= 20: return "PIN_BEAR"
+    if s1["bull"] and (o1 <= c0) and (c1 >= o0) and (abs(c1-o1) > abs(c0-o0)): return "ENGULF_BULL"
+    if s1["bear"] and (o1 >= c0) and (c1 <= o0) and (abs(c1-o1) > abs(c0-o0)): return "ENGULF_BEAR"
+    if s1["body_pct"] >= 80 and s1["upper_pct"] <= 10 and s1["lower_pct"] <= 10:
+        return "MARUBOZU_" + ("BULL" if s1["bull"] else "BEAR")
+    return "NONE"
+
+def build_log_insights(df: pd.DataFrame, ind: dict, price: float):
+    adx = float(ind.get("adx") or 0.0)
+    plus_di = float(ind.get("plus_di") or 0.0)
+    minus_di = float(ind.get("minus_di") or 0.0)
+    atr = float(ind.get("atr") or 0.0)
+    rsi = float(ind.get("rsi") or 0.0)
+
+    bias = "UP" if plus_di > minus_di else ("DOWN" if minus_di > plus_di else "NEUTRAL")
+    regime = "TREND" if adx >= 20 else "RANGE"
+    bias_emoji = "🟢" if bias=="UP" else ("🔴" if bias=="DOWN" else "⚪")
+    regime_emoji = "📡" if regime=="TREND" else "〰️"
+    atr_pct = (atr / max(price or 1e-9, 1e-9)) * 100.0
+    if rsi >= 70: rsi_zone = "RSI🔥 Overbought"
+    elif rsi <= 30: rsi_zone = "RSI❄️ Oversold"
+    else: rsi_zone = "RSI⚖️ Neutral"
+
+    candle = detect_candle_pattern(df)
+    candle_emoji = {
+        "DOJI":"➕", "PIN_BULL":"📈", "PIN_BEAR":"📉",
+        "ENGULF_BULL":"🟩", "ENGULF_BEAR":"🟥",
+        "MARUBOZU_BULL":"🚀", "MARUBOZU_BEAR":"💥",
+        "NONE":"—"
+    }.get(candle, "—")
+
+    return {
+        "regime": regime, "regime_emoji": regime_emoji,
+        "bias": bias, "bias_emoji": bias_emoji,
+        "atr_pct": atr_pct, "rsi_zone": rsi_zone,
+        "candle": candle, "candle_emoji": candle_emoji
     }
 
 # ------------ Range Filter (EXACT) ------------
@@ -267,7 +327,7 @@ def sync_from_exchange_once():
     except Exception as e:
         print(colored(f"❌ sync error: {e}","red"))
 
-# ------------ BingX params helpers (NEW) ------------
+# ------------ BingX params helpers ------------
 def _position_params_for_open(side: str):
     if BINGX_POSITION_MODE == "hedge":
         return {"positionSide": "LONG" if side == "buy" else "SHORT", "reduceOnly": False}
@@ -278,7 +338,7 @@ def _position_params_for_close():
         return {"positionSide": "LONG" if state.get("side")=="long" else "SHORT", "reduceOnly": True}
     return {"positionSide": "BOTH", "reduceOnly": True}
 
-# ------------ Orders (PATCHED) ------------
+# ------------ Orders (patched) ------------
 def open_market(side, qty, price):
     global state
     if qty<=0:
@@ -376,25 +436,37 @@ def smart_exit_check(info, ind):
                 close_market(f"TRAIL_ATR({ATR_MULT_TRAIL}x)"); return True
     return None
 
-# ------------ HUD (PATCHED to show candle close countdown & wait reason) ------------
+# ------------ HUD (rich logs) ------------
 def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
-    left_s = time_to_candle_close(df if df is not None else fetch_ohlcv(), USE_TV_BAR)
+    df = df if df is not None else fetch_ohlcv()
+    left_s = time_to_candle_close(df, USE_TV_BAR)
+    insights = build_log_insights(df, ind, info.get("price"))
+
     print(colored("─"*100,"cyan"))
     print(colored(f"📊 {SYMBOL} {INTERVAL} • {'LIVE' if MODE_LIVE else 'PAPER'} • {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC","cyan"))
     print(colored("─"*100,"cyan"))
+
+    # ===== INDICATORS =====
     print("📈 INDICATORS")
-    print(f"   💲 Price {fmt(info.get('price'))}  RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))}  lo={fmt(info.get('lo'))}")
-    print(f"   RSI({RSI_LEN})={fmt(ind['rsi'])}  +DI={fmt(ind['plus_di'])}  -DI={fmt(ind['minus_di'])}  DX={fmt(ind['dx'])}  ADX({ADX_LEN})={fmt(ind['adx'])}  ATR={fmt(ind['atr'])}")
-    print(f"   ✅ BUY={info['long']}   ❌ SELL={info['short']}   🧮 spread_bps={fmt(spread_bps,2)}   Mode={STRATEGY.upper()}")
+    print(f"   💲 Price {fmt(info.get('price'))}  |  RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))}  lo={fmt(info.get('lo'))}")
+    print(f"   🧮 RSI({RSI_LEN})={fmt(ind['rsi'])}   +DI={fmt(ind['plus_di'])}   -DI={fmt(ind['minus_di'])}   DX={fmt(ind['dx'])}   ADX({ADX_LEN})={fmt(ind['adx'])}   ATR={fmt(ind['atr'])} (~{fmt(insights['atr_pct'],2)}%)")
+    print(f"   🎯 Signal  ✅ BUY={info['long']}   ❌ SELL={info['short']}   |   🧮 spread_bps={fmt(spread_bps,2)}")
+    print(f"   {insights['regime_emoji']} Regime={insights['regime']}   {insights['bias_emoji']} Bias={insights['bias']}   |   {insights['rsi_zone']}")
+    print(f"   🕯️ Candles = {insights['candle_emoji']} {insights['candle']}")
     print(f"   ⏱️ Candle closes in ~ {left_s}s")
     print()
+
+    # ===== POSITION =====
     print("🧭 POSITION")
     print(f"   💰 Balance {fmt(bal,2)} USDT   Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x   PostCloseCooldown={post_close_cooldown}")
     if state["open"]:
-        print(f"   📌 {'🟩 LONG' if state['side']=='long' else '🟥 SHORT'}  Entry={fmt(state['entry'])}  Qty={fmt(state['qty'],4)}  Bars={state['bars']}  PnL={fmt(state['pnl'])}  Trail={fmt(state['trail'])}  TP1_done={state['tp1_done']}")
+        lamp = '🟩 LONG' if state['side']=='long' else '🟥 SHORT'
+        print(f"   📌 {lamp}  Entry={fmt(state['entry'])}  Qty={fmt(state['qty'],4)}  Bars={state['bars']}  PnL={fmt(state['pnl'])}  Trail={fmt(state['trail'])}  TP1_done={state['tp1_done']}")
     else:
         print("   ⚪ FLAT")
     print()
+
+    # ===== RESULTS =====
     print("📦 RESULTS")
     eff_eq = (bal or 0.0) + compound_pnl if MODE_LIVE else compound_pnl
     print(f"   🧮 CompoundPnL {fmt(compound_pnl)}   🚀 EffectiveEq {fmt(eff_eq)} USDT")

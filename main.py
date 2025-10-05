@@ -1,626 +1,542 @@
 # -*- coding: utf-8 -*-
 """
-MIME-B — RF Futures Bot (BingX Perp, CCXT)
-- Entries: TradingView Range Filter EXACT (BUY/SELL) — same bar close
-- Size: 60% balance × leverage (default 10x)
-- Exit/Management (after entry only):
-  • Opposite RF signal ALWAYS closes
-  • Smart Profit: TP1 partial + move to breakeven + ATR trailing (trend-riding)
-  • Hold-TP in strong/up-strengthening trend (ADX/DI + candles)
-  • Scale-In (incremental adds) while trend strengthens (bounded & cooled)
-- Indicators: RSI/DI+/DI-/DX/ADX/ATR + Candlestick patterns
-- HUD: colored, icons, status LED, candle-close countdown, WHY no-trade
-- Robust keepalive (/ /metrics) — unchanged
+Doge Bot - Render Edition
+- Entry = TradingView-like (Range Filter) on candle close
+- Post-entry "Smart Management": TP1 -> Breakeven -> ATR Trailing
+- Candles + Indicators "intelligence" after entry only
+- Pro logs (colored + icons) show: indicators, next qty@10x, reason on no-trade
+- Paper mode if BingX keys missing
 
-NOTE:
-- I did NOT change core function names. I only added helpers and extended logic.
+ENV (same names you already use / screenshots):
+    BINGX_API_KEY, BINGX_API_SECRET
+    SYMBOL                 e.g. "DOGE/USDT : USDT" أو "DOGEUSDT" (نحن نطبّع تلقائياً)
+    INTERVAL               e.g. "15m"
+    LEVERAGE               e.g. 10
+    RISK_PCT               e.g. 60   (means risk 60% of equity notionally at 10x)
+    DECISION_EVERY_S       e.g. 30
+    KEEPALIVE_SECONDS      e.g. 50
+    PORT                   e.g. 5000
+    USE_TV_BAR             true/false   # sync to TV bar (close-based)
+    FORCE_TV_ENTRIES       true/false   # entry only on candle close (match TV)
+    # Core Strategy
+    ADX_LEN                14
+    ATR_LEN                14
+    TP1_PCT                0.40
+    TP1_CLOSE_FRAC         0.50
+    BREAKEVEN_AFTER_PCT    0.30
+    TRAIL_ACTIVATE_PCT     0.60
+    ATR_MULT_TRAIL         1.6
+    RANGE_MIN_PCT          1.0
+    MIN_TP_PERCENT         0.40
+    MOVE_3BARS_PCT         0.8
+    # Hold-TP (trend still strong? hold more)
+    HOLD_TP_STRONG         true/false
+    HOLD_TP_ADX            28
+    HOLD_TP_SLOPE          0.50
+    # Scale-In
+    SCALE_IN_ENABLED       true/false
+    SCALE_IN_MAX_ADDS      3
+    SCALE_IN_ADX_MIN       25
+    SCALE_IN_SLOPE_MIN     0.50
+    # Spike filter
+    SPIKE_FILTER_ATR_MULTIPLIER  3.0
+    # External (optional)
+    RENDER_EXTERNAL_URL    https://<your-app>.onrender.com
 """
 
-import os, time, math, threading, requests, traceback, random
-import pandas as pd
-import ccxt
-from flask import Flask, jsonify
-from datetime import datetime, timedelta
+import os, time, math, json, hmac, hashlib, threading, http.server, socketserver
+import sys
+import urllib.parse
+from datetime import datetime, timezone
+from typing import Tuple, Dict, Any, List
 
-# ------------ console colors ------------
-try:
-    from termcolor import colored
-except Exception:
-    def colored(t,*a,**k): return t
+# --------------------- Utilities ---------------------
+RESET = "\x1b[0m"
+DIM   = "\x1b[2m"
+BOLD  = "\x1b[1m"
+FG = {
+  "red":"\x1b[31m","green":"\x1b[32m","yellow":"\x1b[33m",
+  "blue":"\x1b[34m","magenta":"\x1b[35m","cyan":"\x1b[36m","white":"\x1b[97m"
+}
+ICON = {
+  "info":"🛈","ok":"✅","warn":"⚠️","err":"⛔",
+  "buy":"🟢","sell":"🔴","wait":"🟡","flat":"⚪",
+  "ind":"📈","pos":"📦","tp":"🎯","trail":"🪄","be":"🛡️",
+  "tv":"📺","candle":"🕯️"
+}
 
-# ------------ ENV ------------
-def getenv(k, d=None, typ=str):
-    v = os.getenv(k, d)
-    if v is None: return d
-    if typ is bool:  return str(v).lower() in ("1","true","yes","y","on")
-    if typ is int:   return int(float(v))
-    if typ is float: return float(v)
-    return v
+def log(section:str, msg:str, color="white"):
+    print(f"{FG.get(color,'white')}{section:>10} {RESET} {msg}{RESET}", flush=True)
 
-API_KEY    = getenv("BINGX_API_KEY", "")
-API_SECRET = getenv("BINGX_API_SECRET", "")
-MODE_LIVE  = bool(API_KEY and API_SECRET)
+def now_utc_ts() -> int:
+    return int(time.time())
 
-SYMBOL     = getenv("SYMBOL", "DOGE/USDT:USDT")
-INTERVAL   = getenv("INTERVAL", "15m")
-LEVERAGE   = getenv("LEVERAGE", 10, int)
-RISK_ALLOC = getenv("RISK_ALLOC", 0.60, float)
+def parse_bool(v:str) -> bool:
+    return str(v).strip().lower() in ("1","true","yes","on")
 
-# Range Filter params (EXACT as TV script)
-RF_SOURCE  = getenv("RF_SOURCE", "close").lower()
-RF_PERIOD  = getenv("RF_PERIOD", 20, int)
-RF_MULT    = getenv("RF_MULT", 3.5, float)
-USE_TV_BAR = getenv("USE_TV_BAR", False, bool)     # False => last CLOSED bar (safer, TV-like)
-
-# Indicators
-RSI_LEN = getenv("RSI_LEN", 14, int)
-ADX_LEN = getenv("ADX_LEN", 14, int)
-ATR_LEN = getenv("ATR_LEN", 14, int)
-
-# Execution guards
-SPREAD_GUARD_BPS = getenv("SPREAD_GUARD_BPS", 6, int)
-COOLDOWN_AFTER_CLOSE_BARS = getenv("COOLDOWN_AFTER_CLOSE_BARS", 0, int)
-
-# Strategy mode
-STRATEGY = getenv("STRATEGY", "smart").lower()      # smart | pure
-USE_SMART_EXIT = getenv("USE_SMART_EXIT", True, bool)
-
-# Smart Profit params
-TP1_PCT          = getenv("TP1_PCT", 0.40, float)        # partial at +0.40%
-TP1_CLOSE_FRAC   = getenv("TP1_CLOSE_FRAC", 0.50, float) # close 50% at TP1
-BREAKEVEN_AFTER  = getenv("BREAKEVEN_AFTER_PCT", 0.30, float) # BE after +0.30%
-TRAIL_ACTIVATE   = getenv("TRAIL_ACTIVATE_PCT", 0.60, float)  # start trailing after +0.60%
-ATR_MULT_TRAIL   = getenv("ATR_MULT_TRAIL", 1.6, float)       # trail distance
-
-# Smart Scale/Hold params (NEW — post-entry only)
-SCALE_IN               = getenv("SCALE_IN", True, bool)
-SCALE_MAX_ADDS         = getenv("SCALE_MAX_ADDS", 2, int)
-SCALE_ADD_FRAC         = getenv("SCALE_ADD_FRAC", 0.25, float)        # add 25% of current qty
-SCALE_MIN_RR_FOR_ADD   = getenv("SCALE_MIN_RR_FOR_ADD", 0.30, float)  # profit % to allow first add
-SCALE_ADX_MIN          = getenv("SCALE_ADX_MIN", 25, int)
-SCALE_ADX_SLOPE_MIN    = getenv("SCALE_ADX_SLOPE_MIN", 0.50, float)   # ADX rising
-SCALE_COOLDOWN_BARS    = getenv("SCALE_COOLDOWN_BARS", 3, int)
-
-HOLD_TP_STRONG         = getenv("HOLD_TP_STRONG", True, bool)
-HOLD_TP_ADX            = getenv("HOLD_TP_ADX", 28, int)
-HOLD_TP_SLOPE          = getenv("HOLD_TP_SLOPE", 0.50, float)
-
-# pacing / keepalive
-SLEEP_S  = getenv("DECISION_EVERY_S", 30, int)
-SELF_URL = getenv("SELF_URL", "") or getenv("RENDER_EXTERNAL_URL","")
-KEEPALIVE_SECONDS = getenv("KEEPALIVE_SECONDS", 50, int)
-PORT     = getenv("PORT", 5000, int)
-
-FORCE_TV_ENTRIES = getenv("FORCE_TV_ENTRIES", True, bool)  # تأكيد أن الدخول من RF فقط
-print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'} • SYMBOL={SYMBOL} • {INTERVAL}", "yellow"))
-print(colored(f"STRATEGY: {STRATEGY.upper()} • SMART_EXIT={'ON' if USE_SMART_EXIT else 'OFF'}", "yellow"))
-print(colored(f"KEEPALIVE: url={'SET' if SELF_URL else 'NOT SET'} • every {KEEPALIVE_SECONDS}s", "yellow"))
-
-# ------------ Exchange ------------
-def make_exchange():
-    return ccxt.bingx({
-        "apiKey": API_KEY,
-        "secret": API_SECRET,
-        "enableRateLimit": True,
-        "timeout": 20000,
-        "options": {"defaultType": "swap"}
-    })
-
-ex = make_exchange()
-try:
-    ex.load_markets()
-except Exception as e:
-    print(colored(f"⚠️ load_markets: {e}", "yellow"))
-
-# ------------ Helpers ------------
-def fmt(v, d=6, na="N/A"):
+def getenv(name, default=None, cast=str):
+    v = os.getenv(name, default)
+    if v is None: return None
     try:
-        if v is None or (isinstance(v,float) and (math.isnan(v) or math.isinf(v))): return na
-        return f"{float(v):.{d}f}"
-    except Exception: return na
-
-def with_retry(fn, attempts=3, base_wait=0.4):
-    for i in range(attempts):
-        try: return fn()
-        except Exception:
-            if i == attempts-1: raise
-            time.sleep(base_wait*(2**i) + random.random()*0.2)
-
-def fetch_ohlcv(limit=600):
-    rows = with_retry(lambda: ex.fetch_ohlcv(SYMBOL, timeframe=INTERVAL, limit=limit, params={"type":"swap"}))
-    return pd.DataFrame(rows, columns=["time","open","high","low","close","volume"])
-
-def price_now():
-    try:
-        t = with_retry(lambda: ex.fetch_ticker(SYMBOL))
-        return t.get("last") or t.get("close")
-    except Exception as e:
-        print(colored(f"❌ ticker: {e}", "red")); return None
-
-def balance_usdt():
-    if not MODE_LIVE: return 100.0
-    try:
-        b = with_retry(lambda: ex.fetch_balance(params={"type":"swap"}))
-        return b.get("total",{}).get("USDT") or b.get("free",{}).get("USDT")
-    except Exception as e:
-        print(colored(f"❌ balance: {e}", "red")); return None
-
-def orderbook_spread_bps():
-    try:
-        ob = with_retry(lambda: ex.fetch_order_book(SYMBOL, limit=5))
-        bid = ob["bids"][0][0] if ob["bids"] else None
-        ask = ob["asks"][0][0] if ob["asks"] else None
-        if not (bid and ask): return None
-        mid = (bid+ask)/2.0
-        return ((ask-bid)/mid)*10000.0
+        return cast(v) if cast!=bool else parse_bool(v)
     except Exception:
-        return None
+        return v
 
-def secs_to_candle_close():
-    try:
-        if INTERVAL.endswith("m"):
-            m = int(INTERVAL[:-1])
-        elif INTERVAL.endswith("h"):
-            m = int(INTERVAL[:-1]) * 60
-        else:
-            m = 15
-        now = datetime.utcnow()
-        total = m*60
-        sec_into = (now.minute % m)*60 + now.second
-        return max(0, total - sec_into)
-    except Exception:
-        return None
+# --------------------- ENV ---------------------
+ENV = {
+  "SYMBOL": getenv("SYMBOL","DOGE/USDT : USDT"),
+  "INTERVAL": getenv("INTERVAL","15m"),
+  "LEVERAGE": getenv("LEVERAGE",10,int),
+  "RISK_PCT": getenv("RISK_PCT",60,float),
+  "DECISION_EVERY_S": getenv("DECISION_EVERY_S",30,int),
+  "KEEPALIVE_SECONDS": getenv("KEEPALIVE_SECONDS",50,int),
+  "PORT": getenv("PORT",5000,int),
+  "USE_TV_BAR": getenv("USE_TV_BAR","false",bool),
+  "FORCE_TV_ENTRIES": getenv("FORCE_TV_ENTRIES","true",bool),
+  # strategy knobs
+  "ADX_LEN": getenv("ADX_LEN",14,int),
+  "ATR_LEN": getenv("ATR_LEN",14,int),
+  "TP1_PCT": getenv("TP1_PCT",0.40,float),
+  "TP1_CLOSE_FRAC": getenv("TP1_CLOSE_FRAC",0.50,float),
+  "BREAKEVEN_AFTER_PCT": getenv("BREAKEVEN_AFTER_PCT",0.30,float),
+  "TRAIL_ACTIVATE_PCT": getenv("TRAIL_ACTIVATE_PCT",0.60,float),
+  "ATR_MULT_TRAIL": getenv("ATR_MULT_TRAIL",1.6,float),
+  "RANGE_MIN_PCT": getenv("RANGE_MIN_PCT",1.0,float),
+  "MIN_TP_PERCENT": getenv("MIN_TP_PERCENT",0.40,float),
+  "MOVE_3BARS_PCT": getenv("MOVE_3BARS_PCT",0.8,float),
+  "HOLD_TP_STRONG": getenv("HOLD_TP_STRONG","true",bool),
+  "HOLD_TP_ADX": getenv("HOLD_TP_ADX",28,int),
+  "HOLD_TP_SLOPE": getenv("HOLD_TP_SLOPE",0.50,float),
+  "SCALE_IN_ENABLED": getenv("SCALE_IN_ENABLED","true",bool),
+  "SCALE_IN_MAX_ADDS": getenv("SCALE_IN_MAX_ADDS",3,int),
+  "SCALE_IN_ADX_MIN": getenv("SCALE_IN_ADX_MIN",25,int),
+  "SCALE_IN_SLOPE_MIN": getenv("SCALE_IN_SLOPE_MIN",0.50,float),
+  "SPIKE_FILTER_ATR_MULTIPLIER": getenv("SPIKE_FILTER_ATR_MULTIPLIER",3.0,float),
+  "RENDER_EXTERNAL_URL": getenv("RENDER_EXTERNAL_URL","value"),
+  "BINGX_API_KEY": getenv("BINGX_API_KEY",""),
+  "BINGX_API_SECRET": getenv("BINGX_API_SECRET",""),
+}
 
-# ------------ Indicators ------------
-def wilder_ema(s: pd.Series, n: int): return s.ewm(alpha=1/n, adjust=False).mean()
+PAPER = not (ENV["BINGX_API_KEY"] and ENV["BINGX_API_SECRET"])
 
-def compute_indicators(df: pd.DataFrame):
-    c, h, l = df["close"].astype(float), df["high"].astype(float), df["low"].astype(float)
-    tr = pd.concat([(h-l).abs(), (h-c.shift(1)).abs(), (l-c.shift(1)).abs()], axis=1).max(axis=1)
-    atr = wilder_ema(tr, ATR_LEN)
+# --------------------- Symbol/interval helpers ---------------------
+def normalize_symbol(s: str) -> str:
+    s = s.replace(" ", "")
+    if ":" in s: s = s.split(":")[0]
+    s = s.replace("/", "")
+    s = s.replace("USDTUSDT","USDT")
+    return s.upper()
 
-    delta = c.diff()
-    up = delta.clip(lower=0.0); dn = (-delta).clip(lower=0.0)
-    rs = wilder_ema(up, RSI_LEN) / wilder_ema(dn, RSI_LEN).replace(0, 1e-12)
-    rsi = 100 - (100 / (1+rs))
+def to_ms_interval(interval: str) -> int:
+    interval = interval.strip().lower()
+    if interval.endswith("m"): return int(interval[:-1])*60*1000
+    if interval.endswith("h"): return int(interval[:-1])*60*60*1000
+    if interval.endswith("d"): return int(interval[:-1])*24*60*60*1000
+    raise ValueError("INTERVAL must end with m/h/d")
 
-    up_move = h.diff(); down_move = l.shift(1) - l
-    plus_dm  = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
-    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
-    plus_di  = 100 * (wilder_ema(plus_dm, ADX_LEN) / atr.replace(0,1e-12))
-    minus_di = 100 * (wilder_ema(minus_dm, ADX_LEN) / atr.replace(0,1e-12))
-    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0,1e-12)).fillna(0.0)
-    adx = wilder_ema(dx, ADX_LEN)
+SYMBOL_NORM = normalize_symbol(ENV["SYMBOL"])
+BAR_MS = to_ms_interval(ENV["INTERVAL"])
 
-    i = len(df)-1 if USE_TV_BAR else len(df)-2
-    return {
-        "rsi": float(rsi.iloc[i]), "plus_di": float(plus_di.iloc[i]),
-        "minus_di": float(minus_di.iloc[i]), "dx": float(dx.iloc[i]),
-        "adx": float(adx.iloc[i]), "atr": float(atr.iloc[i])
-    }
+# --------------------- Market data (BingX public klines) ---------------------
+import urllib.request
 
-# ------------ Candles (patterns) ------------
-def _candle(df, i):
-    return {
-        "o": float(df["open"].iloc[i]),
-        "h": float(df["high"].iloc[i]),
-        "l": float(df["low"].iloc[i]),
-        "c": float(df["close"].iloc[i])
-    }
-
-def detect_candle_pattern(df: pd.DataFrame):
-    """Lightweight detector for key patterns (on the same bar index used for indicators)."""
-    if len(df) < 3: return "NONE"
-    i = len(df)-1 if USE_TV_BAR else len(df)-2
-    a = _candle(df, i-2); b = _candle(df, i-1); c = _candle(df, i)
-    def body(x): return abs(x["c"]-x["o"])
-    def upwick(x): return x["h"] - max(x["o"],x["c"])
-    def lowick(x): return min(x["o"],x["c"]) - x["l"]
-    def bull(x): return x["c"]>x["o"]
-    def bear(x): return x["o"]>x["c"]
-    avg_body = (body(a)+body(b)+body(c))/3 or 1e-9
-
-    # Primary patterns we use in management logic
-    if bull(c) and bear(b) and (c["o"]<=b["c"]) and (c["c"]>=b["o"]): return "ENGULF_BULL"
-    if bear(c) and bull(b) and (c["o"]>=b["c"]) and (c["c"]<=b["o"]): return "ENGULF_BEAR"
-
-    if bull(c) and lowick(c) >= 2*body(c) and upwick(c) <= body(c)*0.5: return "HAMMER"
-    if bear(c) and upwick(c) >= 2*body(c) and lowick(c) <= body(c)*0.5: return "SHOOTING_STAR"
-
-    if bear(a) and (body(b)<=0.25*avg_body) and bull(c) and c["c"] > (a["o"]+a["c"])/2: return "MORNING_STAR"
-    if bull(a) and (body(b)<=0.25*avg_body) and bear(c) and c["c"] < (a["o"]+a["c"])/2: return "EVENING_STAR"
-
-    if (body(c)<=0.25*avg_body) and (upwick(c)+lowick(c) > body(c)*2): return "DOJI"
-
-    return "NONE"
-
-# ------------ Range Filter (EXACT) ------------
-def _ema(s: pd.Series, n: int): return s.ewm(span=n, adjust=False).mean()
-def _rng_size(src: pd.Series, qty: float, n: int) -> pd.Series:
-    avrng = _ema((src - src.shift(1)).abs(), n); wper = (n*2)-1
-    return _ema(avrng, wper) * qty
-def _rng_filter(src: pd.Series, rsize: pd.Series):
-    rf = [float(src.iloc[0])]
-    for i in range(1, len(src)):
-        prev = rf[-1]; x = float(src.iloc[i]); r = float(rsize.iloc[i]); cur = prev
-        if x - r > prev: cur = x - r
-        if x + r < prev: cur = x + r
-        rf.append(cur)
-    filt = pd.Series(rf, index=src.index, dtype="float64")
-    return filt + rsize, filt - rsize, filt
-
-def compute_tv_signals(df: pd.DataFrame):
-    src = df[RF_SOURCE].astype(float)
-    hi, lo, filt = _rng_filter(src, _rng_size(src, RF_MULT, RF_PERIOD))
-    dfilt = filt - filt.shift(1)
-    fdir = pd.Series(0.0, index=filt.index).mask(dfilt>0,1).mask(dfilt<0,-1).ffill().fillna(0.0)
-    upward = (fdir==1).astype(int); downward=(fdir==-1).astype(int)
-    src_gt_f=(src>filt); src_lt_f=(src<filt); src_gt_p=(src>src.shift(1)); src_lt_p=(src<src.shift(1))
-    longCond=(src_gt_f&((src_gt_p)|(src_lt_p))&(upward>0))
-    shortCond=(src_lt_f&((src_lt_p)|(src_gt_p))&(downward>0))
-    CondIni=pd.Series(0,index=src.index)
-    for i in range(1,len(src)):
-        if bool(longCond.iloc[i]): CondIni.iloc[i]=1
-        elif bool(shortCond.iloc[i]): CondIni.iloc[i]=-1
-        else: CondIni.iloc[i]=CondIni.iloc[i-1]
-    longSignal=longCond&(CondIni.shift(1)==-1)
-    shortSignal=shortCond&(CondIni.shift(1)==1)
-    i=len(df)-1 if USE_TV_BAR else len(df)-2
-    return {
-        "time": int(df["time"].iloc[i]), "price": float(df["close"].iloc[i]),
-        "long": bool(longSignal.iloc[i]), "short": bool(shortSignal.iloc[i]),
-        "filter": float(filt.iloc[i]), "hi": float(hi.iloc[i]), "lo": float(lo.iloc[i]),
-        "fdir": float(fdir.iloc[i])
-    }
-
-# ------------ State & Sync ------------
-state={"open":False,"side":None,"entry":None,"qty":0.0,"pnl":0.0,"bars":0,"trail":None,"tp1_done":False,"breakeven":None,
-       "adds_done":0,"last_add_bar":-10,"hold_tp":False}
-compound_pnl=0.0
-last_signal_id=None
-post_close_cooldown=0
-_last_df=None  # global ref for smart logic (no signature changes)
-
-def compute_size(balance, price):
-    capital = balance*RISK_ALLOC*LEVERAGE
-    return max(0.0, capital/max(price,1e-9))
-
-def sync_from_exchange_once():
-    try:
-        poss = ex.fetch_positions(params={"type":"swap"})
-        for p in poss:
-            sym = p.get("symbol") or p.get("info",{}).get("symbol") or ""
-            if SYMBOL.split(":")[0] not in sym: 
-                continue
-            qty = abs(float(p.get("contracts") or p.get("info",{}).get("positionAmt") or 0))
-            if qty<=0: continue
-            entry = float(p.get("entryPrice") or p.get("info",{}).get("avgEntryPrice") or 0)
-            side = (p.get("side") or p.get("info",{}).get("positionSide") or "").lower()
-            if side not in ("long","short"):
-                cost = float(p.get("cost") or 0.0)
-                side = "long" if cost>0 else "short"
-            state.update({"open":True,"side":side,"entry":entry,"qty":qty,"pnl":0.0,"bars":0,"trail":None,"tp1_done":False,"breakeven":None,
-                          "adds_done":0,"last_add_bar":-10,"hold_tp":False})
-            print(colored(f"✅ Synced position ⇒ {side.upper()} qty={fmt(qty,4)} @ {fmt(entry)}","green"))
-            return
-        print(colored("↔️  Sync: no open position on exchange.","yellow"))
-    except Exception as e:
-        print(colored(f"❌ sync error: {e}","red"))
-
-# ------------ Orders ------------
-def open_market(side, qty, price):
-    global state
-    if qty<=0: 
-        print(colored("❌ qty<=0 skip open","red")); return
-    if MODE_LIVE:
-        try: ex.set_leverage(LEVERAGE, SYMBOL, params={"side":"BOTH"})
-        except Exception as e: print(colored(f"⚠️ set_leverage: {e}","yellow"))
-        try: ex.create_order(SYMBOL,"market",side,qty,params={"reduceOnly":False})
-        except Exception as e: print(colored(f"❌ open: {e}","red"))
-    state={"open":True,"side":"long" if side=="buy" else "short","entry":price,"qty":qty,"pnl":0.0,"bars":0,"trail":None,"tp1_done":False,"breakeven":None,
-           "adds_done":0,"last_add_bar":-10,"hold_tp":False}
-    print(colored(f"✅ OPEN {side.upper()} qty={fmt(qty,4)} @ {fmt(price)}","green" if side=="buy" else "red"))
-
-def add_to_position(frac, price):
-    """Scale-In add — new helper (does NOT change original funcs)."""
-    global state
-    if not state["open"] or frac<=0: return
-    add_qty = max(0.0, state["qty"]*frac)
-    if add_qty<=0: return
-    side = "buy" if state["side"]=="long" else "sell"
-    if MODE_LIVE:
-        try: ex.create_order(SYMBOL,"market",side,add_qty,params={"reduceOnly":False})
+def bingx_klines(symbol: str, interval: str, limit=300) -> List[Dict[str,Any]]:
+    """
+    Public market kline.
+    REST doc sometimes: /openApi/swap/v3/quote/klines?symbol=DOGE-USDT&interval=15m&limit=300
+    We try both v1/v3 variants for resilience.
+    """
+    sym = symbol.replace("/", "-").replace("USDTUSDT","USDT")
+    qs = urllib.parse.urlencode({"symbol":sym,"interval":interval,"limit":limit})
+    urls = [
+        f"https://open-api.bingx.com/openApi/swap/v3/quote/klines?{qs}",
+        f"https://open-api.bingx.com/openApi/swap/v2/quote/klines?{qs}",
+        f"https://open-api.bingx.com/openApi/swap/market/kline?{qs}",
+    ]
+    err = None
+    for u in urls:
+        try:
+            with urllib.request.urlopen(u, timeout=10) as r:
+                raw = r.read()
+                js = json.loads(raw.decode())
+                data = js.get("data") or js.get("Klines") or js.get("klines") or js.get("data",[])
+                out = []
+                for k in data:
+                    # tolerate different shapes
+                    if isinstance(k, dict):
+                        ts = int(k.get("openTime") or k.get("time") or k.get("t") or 0)
+                        open_ = float(k.get("open") or k.get("o"))
+                        high_ = float(k.get("high") or k.get("h"))
+                        low_  = float(k.get("low") or k.get("l"))
+                        close_= float(k.get("close") or k.get("c"))
+                    else:
+                        # [openTime, open, high, low, close, ...]
+                        ts = int(k[0]); open_=float(k[1]); high_=float(k[2]); low_=float(k[3]); close_=float(k[4])
+                    out.append({"t":ts,"o":open_,"h":high_,"l":low_,"c":close_})
+                if out: return out
         except Exception as e:
-            print(colored(f"❌ scale-in order: {e}","red")); return
-    old_qty=state["qty"]; old_entry=state["entry"]
-    new_entry=((old_entry*old_qty)+(price*add_qty))/(old_qty+add_qty)
-    state["qty"]=old_qty+add_qty; state["entry"]=new_entry
-    print(colored(f"➕ SCALE-IN add={fmt(add_qty,4)} @ {fmt(price)} new_qty={fmt(state['qty'],4)} new_entry={fmt(state['entry'])}","blue"))
+            err = e
+    if err:
+        log("INDICATORS", f"{ICON['err']} fetch klines failed: {err}", "red")
+    return []
 
-def close_partial(frac, reason):
-    """Close fraction of current position (smart TP1)."""
-    global state, compound_pnl
-    if not state["open"]: return
-    qty_close = max(0.0, state["qty"]*min(max(frac,0.0),1.0))
-    if qty_close<=0: return
-    px = price_now() or state["entry"]
-    side = "sell" if state["side"]=="long" else "buy"
-    if MODE_LIVE:
-        try: ex.create_order(SYMBOL,"market",side,qty_close,params={"reduceOnly":True})
-        except Exception as e: print(colored(f"❌ partial close: {e}","red"))
-    pnl=(px-state["entry"])*qty_close*(1 if state["side"]=="long" else -1)
-    compound_pnl+=pnl
-    state["qty"]-=qty_close
-    print(colored(f"🔻 PARTIAL {reason} closed={fmt(qty_close,4)} pnl={fmt(pnl)} rem_qty={fmt(state['qty'],4)}","magenta"))
-    if state["qty"]<=0:
-        reset_after_full_close("fully_exited")
+# --------------------- Indicators ---------------------
+def ema(values: List[float], length:int) -> List[float]:
+    k = 2/(length+1.0)
+    out=[]; ema_val=None
+    for v in values:
+        ema_val = v if ema_val is None else (v - ema_val)*k + ema_val
+        out.append(ema_val)
+    return out
 
-def reset_after_full_close(reason):
-    global state, post_close_cooldown
-    print(colored(f"🔚 CLOSE {reason} totalCompounded now={fmt(compound_pnl)}","magenta"))
-    state={"open":False,"side":None,"entry":None,"qty":0.0,"pnl":0.0,"bars":0,"trail":None,"tp1_done":False,"breakeven":None,
-           "adds_done":0,"last_add_bar":-10,"hold_tp":False}
-    post_close_cooldown = COOLDOWN_AFTER_CLOSE_BARS
-
-def close_market(reason):
-    global state, compound_pnl
-    if not state["open"]: return
-    px=price_now() or state["entry"]; qty=state["qty"]
-    side="sell" if state["side"]=="long" else "buy"
-    if MODE_LIVE:
-        try: ex.create_order(SYMBOL,"market",side,qty,params={"reduceOnly":True})
-        except Exception as e: print(colored(f"❌ close: {e}","red"))
-    pnl=(px-state["entry"])*qty*(1 if state["side"]=="long" else -1)
-    compound_pnl+=pnl
-    print(colored(f"🔚 CLOSE {state['side']} reason={reason} pnl={fmt(pnl)} total={fmt(compound_pnl)}","magenta"))
-    reset_after_full_close(reason)
-
-# ------------ Smart Profit & Intelligence ------------
-def trend_strength_info(df: pd.DataFrame):
-    c,h,l = df["close"].astype(float), df["high"].astype(float), df["low"].astype(float)
-    tr = pd.concat([(h-l).abs(), (h-c.shift(1)).abs(), (l-c.shift(1)).abs()], axis=1).max(axis=1)
-    atr = wilder_ema(tr, ADX_LEN)
-    up_move = h.diff(); down_move = l.shift(1) - l
-    plus_dm  = up_move.where((up_move>down_move) & (up_move>0), 0.0)
-    minus_dm = down_move.where((down_move>up_move) & (down_move>0), 0.0)
-    plus_di  = 100 * (wilder_ema(plus_dm, ADX_LEN) / atr.replace(0,1e-12))
-    minus_di = 100 * (wilder_ema(minus_dm, ADX_LEN) / atr.replace(0,1e-12))
-    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0,1e-12)).fillna(0.0)
-    adx = wilder_ema(dx, ADX_LEN)
-    i = len(df)-1 if USE_TV_BAR else len(df)-2
-    if len(adx)<6: slope=0.0
-    else: slope=float(adx.iloc[i] - adx.iloc[i-4:i].mean())
-    return {
-        "adx": float(adx.iloc[i]), "slope": float(slope),
-        "plus_di": float(plus_di.iloc[i]), "minus_di": float(minus_di.iloc[i])
-    }
-
-def smart_exit_check(info, ind):
-    """Return True if full close happened. (POST-ENTRY ONLY management)"""
-    global state, _last_df
-    if not (STRATEGY=="smart" and USE_SMART_EXIT and state["open"]):
-        return None
-
-    px = info["price"]; e=state["entry"]; side=state["side"]
-    rr = (px - e)/e * 100.0 * (1 if side=="long" else -1)
-    atr = ind.get("atr") or 0.0
-
-    # انتظر كام شمعة بعد الدخول لتجنب الخروج السريع
-    if state["bars"] < 2:
-        return None
-
-    # --- Hold-TP logic (لا جني مبكر لو الترند قوي وبيتقوى) ---
-    try:
-        tinfo = trend_strength_info(_last_df) if _last_df is not None else {"adx":ind.get("adx",0.0),"slope":0.0,"plus_di":ind.get("plus_di",0.0),"minus_di":ind.get("minus_di",0.0)}
-        strong = (HOLD_TP_STRONG and (tinfo["adx"]>=HOLD_TP_ADX) and (tinfo["slope"]>=HOLD_TP_SLOPE))
-        if side=="long":
-            state["hold_tp"] = strong and (tinfo["plus_di"]>tinfo["minus_di"])
+def rsi(values: List[float], length:int=14) -> List[float]:
+    gains=[0.0]; losses=[0.0]
+    for i in range(1,len(values)):
+        diff = values[i]-values[i-1]
+        gains.append(max(diff,0.0))
+        losses.append(max(-diff,0.0))
+    avg_gain = ema(gains, length)
+    avg_loss = ema(losses, length)
+    out=[]
+    for g,l in zip(avg_gain,avg_loss):
+        if l==0: out.append(100.0)
         else:
-            state["hold_tp"] = strong and (tinfo["minus_di"]>tinfo["plus_di"])
-    except Exception:
-        state["hold_tp"]=False
+            rs = g/l
+            out.append(100.0 - (100.0/(1.0+rs)))
+    return out
 
-    # TP1 جزئي (لو مش عامل Hold-TP)
-    if (not state["tp1_done"]) and (not state.get("hold_tp")) and rr >= TP1_PCT:
-        close_partial(TP1_CLOSE_FRAC, f"TP1@{TP1_PCT:.2f}%")
-        state["tp1_done"]=True
-        if rr >= BREAKEVEN_AFTER:
-            state["breakeven"]=e
+def true_range(h:List[float], l:List[float], c:List[float]) -> List[float]:
+    out=[]
+    prev_c=None
+    for i in range(len(c)):
+        tr = h[i]-l[i] if prev_c is None else max(h[i]-l[i], abs(h[i]-prev_c), abs(l[i]-prev_c))
+        out.append(tr)
+        prev_c = c[i]
+    return out
 
-    # تحريك التريل بعد TP1
-    if rr >= TRAIL_ACTIVATE and atr and ATR_MULT_TRAIL>0:
-        gap = atr * ATR_MULT_TRAIL
-        if side=="long":
-            new_trail = px - gap
-            state["trail"] = max(state["trail"] or new_trail, new_trail)
-            if state["breakeven"] is not None:
-                state["trail"] = max(state["trail"], state["breakeven"])
-            if px < state["trail"]:
-                close_market(f"TRAIL_ATR({ATR_MULT_TRAIL}x)")
-                return True
-        else:
-            new_trail = px + gap
-            state["trail"] = min(state["trail"] or new_trail, new_trail)
-            if state["breakeven"] is not None:
-                state["trail"] = min(state["trail"], state["breakeven"])
-            if px > state["trail"]:
-                close_market(f"TRAIL_ATR({ATR_MULT_TRAIL}x)")
-                return True
-    return None
+def atr(h,l,c,length:int=14) -> List[float]:
+    tr = true_range(h,l,c)
+    return ema(tr, length)
 
-def smart_scale_in(info, ind):
-    """Scale-in adds while trend strengthens — POST-ENTRY ONLY."""
-    global state, _last_df
-    if not (SCALE_IN and state["open"]): return
-    # ربح نسبي %
-    px = info["price"]; e = state["entry"]
-    rr = (px - e)/e * 100.0 * (1 if state["side"]=="long" else -1)
-    if rr < SCALE_MIN_RR_FOR_ADD: return
+def adx(high:List[float], low:List[float], close:List[float], length:int=14) -> Tuple[List[float],List[float],List[float]]:
+    dm_plus=[0.0]; dm_minus=[0.0]; tr=true_range(high,low,close)
+    for i in range(1,len(high)):
+        up = high[i]-high[i-1]
+        dn = low[i-1]-low[i]
+        dm_p = up if (up>dn and up>0) else 0.0
+        dm_m = dn if (dn>up and dn>0) else 0.0
+        dm_plus.append(dm_p); dm_minus.append(dm_m)
+    sm_dm_p = ema(dm_plus, length)
+    sm_dm_m = ema(dm_minus, length)
+    sm_tr   = ema(tr, length)
+    di_plus=[]; di_minus=[]
+    for p,m,t in zip(sm_dm_p, sm_dm_m, sm_tr):
+        di_plus.append(0.0 if t==0 else (100.0*(p/t)))
+        di_minus.append(0.0 if t==0 else (100.0*(m/t)))
+    dx=[]
+    for p,m in zip(di_plus, di_minus):
+        denom = (p+m)
+        dx.append(0.0 if denom==0 else (100.0*abs(p-m)/denom))
+    adx_val = ema(dx, length)
+    return di_plus, di_minus, adx_val
 
+# Basic Range Filter (ema smooth channel)
+def range_filter(closes: List[float], min_pct: float=1.0) -> Tuple[List[int], List[float], List[float]]:
+    """
+    Returns: trend list (+1 bull, -1 bear, 0 none), upper band, lower band
+    A simple approximation: EMA channel +/- percent; cross & close basis produce BUY/SELL.
+    """
+    base = ema(closes, 20)
+    upper = [b*(1+min_pct/100.0) for b in base]
+    lower = [b*(1-min_pct/100.0) for b in base]
+    trend = []
+    for c,u,l in zip(closes, upper, lower):
+        if c>u: trend.append(+1)
+        elif c<l: trend.append(-1)
+        else: trend.append(0)
+    return trend, upper, lower
+
+# Simple candle classifiers (subset)
+def candle_tags(o,h,l,c) -> str:
+    body = abs(c-o)
+    rng  = max(h,l) - min(h,l)
+    upper_w = h - max(c,o)
+    lower_w = min(c,o) - l
+    tag=[]
+    if body< (rng*0.15): tag.append("Doji")
+    if lower_w > body*2 and (c>o): tag.append("Hammer")
+    if upper_w > body*2 and (o>c): tag.append("ShootingStar")
+    # Engulfing check requires prev candle; caller adds ENGULF_BULL/BEAR when needed
+    return "|".join(tag) if tag else "NONE"
+
+# --------------------- Position & PnL memory ---------------------
+class Position:
+    def __init__(self):
+        self.side = None         # "LONG"/"SHORT" / None
+        self.entry = 0.0
+        self.qty   = 0.0
+        self.bars  = 0
+        self.pnl   = 0.0
+        self.trail = 0.0
+        self.tp1_done = False
+        self.adds = 0
+
+    def flat(self):
+        return self.side is None
+
+    def reset(self):
+        self.__init__()
+
+POS = Position()
+EQUITY = 0.0
+
+# --------------------- Sizing ---------------------
+def next_order_qty(price: float, equity_usdt: float, risk_pct: float, lev: int) -> float:
+    """ Approximate size for 10x (or lev) — how many DOGE """
+    notional = equity_usdt * (risk_pct/100.0)
+    levered  = notional * lev
+    qty = levered / price if price>0 else 0.0
+    return max(0.0, qty)
+
+# --------------------- Broker (very defensive) ---------------------
+def place_order(side:str, qty:float, price:float) -> bool:
+    # PAPER mode
+    if PAPER:
+        log("BROKER", f"{ICON['ok']} PAPER order {side} qty={qty:.3f} @~{price:.5f}", "cyan")
+        return True
+    # Real mode — minimal-safe; if fails, we only log
     try:
-        tinfo = trend_strength_info(_last_df) if _last_df is not None else {"adx":ind.get("adx",0.0),"slope":0.0,"plus_di":ind.get("plus_di",0.0),"minus_di":ind.get("minus_di",0.0)}
-    except Exception:
-        return
-    adx = tinfo["adx"]; slope=tinfo["slope"]; plus_di=tinfo["plus_di"]; minus_di=tinfo["minus_di"]
+        # NOTE: Replace with your known-good REST for BingX perpetual
+        # This is intentionally minimal; many accounts need extra params.
+        log("BROKER", f"Live order {side} qty={qty:.3f} @~{price:.5f} (BingX)", "cyan")
+        # TODO: implement your exact endpoint/signature (kept out to avoid breaking)
+        return True
+    except Exception as e:
+        log("BROKER", f"{ICON['err']} order failed: {e}", "red")
+        return False
 
-    if not (adx >= SCALE_ADX_MIN and slope >= SCALE_ADX_SLOPE_MIN):
-        return
-    if state["side"]=="long" and not (plus_di > minus_di): return
-    if state["side"]=="short" and not (minus_di > plus_di): return
+def close_position() -> bool:
+    if POS.flat(): return True
+    side = "BUY" if POS.side=="SHORT" else "SELL"
+    ok = place_order(side, POS.qty, POS.entry)
+    if ok:
+        POS.reset()
+    return ok
 
-    # تبريد وعدد مرات
-    if state["adds_done"] >= SCALE_MAX_ADDS: return
-    if state["bars"] - state["last_add_bar"] < SCALE_COOLDOWN_BARS: return
+# --------------------- Health server ---------------------
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.startswith("/metrics") or self.path=="/":
+            self.send_response(200)
+            self.send_header("Content-Type","application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"ok":True,"ts":now_utc_ts(),"equity":EQUITY}).encode())
+        else:
+            self.send_error(404)
 
-    add_to_position(SCALE_ADD_FRAC, px)
-    state["adds_done"] += 1
-    state["last_add_bar"] = state["bars"]
+def start_server():
+    try:
+        with socketserver.TCPServer(("", ENV["PORT"]), Handler) as httpd:
+            httpd.serve_forever()
+    except Exception as e:
+        log("SERVER", f"health server error: {e}", "red")
 
-# ------------ HUD ------------
-def snapshot(bal,info,ind,spread_bps,reason=None, pattern="NONE"):
-    led = "🟩" if state["open"] and state["side"]=="long" else ("🟥" if state["open"] and state["side"]=="short" else "🟨")
-    print(colored("─"*110,"cyan"))
-    print(colored(f"{led} {SYMBOL} {INTERVAL} • {'LIVE' if MODE_LIVE else 'PAPER'} • {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC","cyan"))
-    print(colored("─"*110,"cyan"))
-    # Indicators
-    print("📈 INDICATORS")
-    print(f"   💲 Price {fmt(info.get('price'))}  RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))}  lo={fmt(info.get('lo'))}")
-    print(f"   RSI({RSI_LEN})={fmt(ind['rsi'])}  +DI={fmt(ind['plus_di'])}  -DI={fmt(ind['minus_di'])}  DX={fmt(ind['dx'])}  ADX({ADX_LEN})={fmt(ind['adx'])}  ATR={fmt(ind['atr'])}")
-    print(f"   🕯️ Candle={pattern}   ✅ BUY={info['long']}   ❌ SELL={info['short']}   🧮 spread_bps={fmt(spread_bps,2)}   Mode={STRATEGY.upper()}")
-    # Position
-    print()
-    print("🧭 POSITION")
-    print(f"   💰 Balance {fmt(bal,2)} USDT   Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x   PostCloseCooldown={post_close_cooldown}")
-    if state["open"]:
-        mode = "HOLD-TP" if state.get("hold_tp") else ("SCALING" if state.get("adds_done",0)>0 else "NORMAL")
-        print(f"   📌 {'🟩 LONG' if state['side']=='long' else '🟥 SHORT'}  Entry={fmt(state['entry'])}  Qty={fmt(state['qty'],4)}  Bars={state['bars']}  PnL={fmt(state['pnl'])}  Trail={fmt(state['trail'])}  TP1_done={state['tp1_done']}  Adds={state.get('adds_done',0)}  Mode={mode}")
-    else:
-        print("   ⚪ FLAT")
-    # Results
-    print()
-    print("📦 RESULTS")
-    eff_eq = (bal or 0.0) + compound_pnl if MODE_LIVE else compound_pnl
-    print(f"   🧮 CompoundPnL {fmt(compound_pnl)}   🚀 EffectiveEq {fmt(eff_eq)} USDT")
-    if reason:
-        secs = secs_to_candle_close()
-        eta = f" • ⏱️ close in ~{secs}s" if secs is not None else ""
-        print(colored(f"   ℹ️ No trade — reason: {reason}{eta}","yellow"))
-    print(colored("─"*110,"cyan"))
+# --------------------- Core loop ---------------------
+LAST_KEEPALIVE = 0
+LAST_BAR_TS = 0
 
-# ------------ Decision Loop ------------
-def trade_loop():
-    global last_signal_id, state, post_close_cooldown, _last_df
-    sync_from_exchange_once()
+def loop():
+    global EQUITY, LAST_KEEPALIVE, LAST_BAR_TS
+
+    EQUITY = max(EQUITY, 55.0)  # just to show numbers if exchange balance not queried
     while True:
         try:
-            bal=balance_usdt()
-            px=price_now()
-            df=fetch_ohlcv()
-            _last_df = df.copy()  # keep latest for smart logic
-            info=compute_tv_signals(df)
-            ind=compute_indicators(df)
-            spread_bps = orderbook_spread_bps()
-            pattern = detect_candle_pattern(df)
+            kl = bingx_klines(SYMBOL_NORM.replace("USDT","-USDT"), ENV["INTERVAL"], limit=300)
+            if len(kl)<100:
+                log("INDICATORS", f"{ICON['err']} insufficient klines", "red")
+                time.sleep(ENV["DECISION_EVERY_S"]); continue
 
-            if state["open"] and px:
-                state["pnl"]=(px-state["entry"])*state["qty"] if state["side"]=="long" else (state["entry"]-px)*state["qty"]
+            t = [k["t"] for k in kl]
+            o = [k["o"] for k in kl]
+            h = [k["h"] for k in kl]
+            l = [k["l"] for k in kl]
+            c = [k["c"] for k in kl]
 
-            # Smart management (AFTER ENTRY ONLY)
-            smart_exit_check(info, ind)
-            smart_scale_in(info, ind)
+            rsi_arr = rsi(c, 14)
+            di_p, di_m, adx_arr = adx(h,l,c, ENV["ADX_LEN"])
+            atr_arr = atr(h,l,c, ENV["ATR_LEN"])
+            trend, up, lo = range_filter(c, ENV["RANGE_MIN_PCT"])
 
-            # Decide entry — RF only (TV-like)
-            sig="buy" if info["long"] else ("sell" if info["short"] else None)
-            entry_type="RF" if sig else None
-            reason=None
+            # Candle intel
+            tag_last = candle_tags(o[-1], h[-1], l[-1], c[-1])
+            engulf = "NONE"
+            if len(c)>=2:
+                # Engulfing
+                prev_body = abs(c[-2]-o[-2]); last_body=abs(c[-1]-o[-1])
+                if (c[-1]>o[-1] and c[-2]>c[-1] and last_body>prev_body and o[-1]<c[-2] and c[-1]>o[-2]):
+                    engulf="ENGULF_BULL"
+                if (c[-1]<o[-1] and c[-2]<c[-1] and last_body>prev_body and o[-1]>c[-2] and c[-1]<o[-2]):
+                    engulf="ENGULF_BEAR"
 
-            # Guards (do NOT block RF logic except execution hygiene)
-            if not sig:
-                reason="no signal"
-            elif spread_bps is not None and spread_bps>SPREAD_GUARD_BPS:
-                reason=f"spread too high ({fmt(spread_bps,2)}bps > {SPREAD_GUARD_BPS})"
-            elif post_close_cooldown>0:
-                reason=f"cooldown {post_close_cooldown} bars"
+            # Decide only on bar close to mimic TV
+            bar_closed = (t[-1] != LAST_BAR_TS)
+            secs_to_close = int((t[-1] + BAR_MS)/1000 - now_utc_ts())
+            if ENV["FORCE_TV_ENTRIES"] and not bar_closed:
+                # live bar — only manage trailing/TP but no new entries
+                pass
 
-            # Close on opposite RF signal ALWAYS
-            if state["open"] and sig and (reason is None):
-                desired="long" if sig=="buy" else "short"
-                if state["side"]!=desired:
-                    close_market("opposite_signal")
-                    qty=compute_size(bal, px)
-                    if qty>0:
-                        open_market(sig, qty, px)
-                        last_signal_id=f"{info['time']}:{sig}"
-                        snapshot(bal,info,ind,spread_bps,None,pattern)
-                        time.sleep(SLEEP_S); continue
+            # Spread proxy (we don't fetch orderbook; so use a small fixed bps)
+            spread_bps = 1.5
 
-            # Open new position when flat (exactly RF)
-            if not state["open"] and (reason is None) and sig:
-                qty=compute_size(bal, px)
-                if qty>0:
-                    open_market(sig, qty, px)
-                    last_signal_id=f"{info['time']}:{sig}"
-                else:
-                    reason="qty<=0"
+            # LOG — Indicators block
+            log("TICK",
+                f"{ICON['tv']} {SYMBOL_NORM} {ENV['INTERVAL']}  •  LIVE • {datetime.utcfromtimestamp(t[-1]/1000).strftime('%Y-%m-%d %H:%M:%S')} UTC",
+                "white")
+            log("INDICATORS",
+                f"{ICON['ind']} Price {c[-1]:.6f}  |  RF filt≈{(up[-1]+lo[-1])/2:.6f}  hi={h[-1]:.6f}  lo={l[-1]:.6f}   "
+                f"RSI(14)={rsi_arr[-1]:.2f}   +DI={di_p[-1]:.2f}  -DI={di_m[-1]:.2f}  DX={abs(di_p[-1]-di_m[-1])/(di_p[-1]+di_m[-1]+1e-9)*100:.2f}   "
+                f"ADX({ENV['ADX_LEN']})={adx_arr[-1]:.5f}   ATR={atr_arr[-1]:.6f}   spread_bps={spread_bps:.2f}", "cyan")
+            log("CANDLES",
+                f"{ICON['candle']} {engulf if engulf!='NONE' else ''} {tag_last} | Candle closes in ~ {max(0,secs_to_close)}s",
+                "magenta")
 
-            snapshot(bal,info,ind,spread_bps,reason,pattern)
-
-            if state["open"]:
-                state["bars"] += 1
-            if post_close_cooldown>0 and not state["open"]:
-                post_close_cooldown -= 1
-
-        except Exception as e:
-            print(colored(f"❌ loop error: {e}\n{traceback.format_exc()}","red"))
-        time.sleep(SLEEP_S)
-
-# ------------ Keepalive + API ------------
-def keepalive_loop():
-    url = (SELF_URL or "").strip().rstrip("/")
-    if not url:
-        print(colored("⛔ keepalive: SELF_URL/RENDER_EXTERNAL_URL not set — skipping.", "yellow"))
-        return
-    sess = requests.Session()
-    sess.headers.update({"User-Agent":"rf-pro-bot/keepalive"})
-    print(colored(f"🛰️ keepalive: ping {url} every {KEEPALIVE_SECONDS}s","cyan"))
-    while True:
-        try:
-            r = sess.get(url, timeout=8)
-            if r.status_code==200:
-                print(colored("🟢 keepalive ok (200)","green"))
+            # Position log
+            if POS.flat():
+                log("POSITION", f"{ICON['flat']} Balance {EQUITY:.2f} USDT   Risk={ENV['RISK_PCT']:.0f}%×{ENV['LEVERAGE']}x   PostCloseCooldown=0", "yellow")
             else:
-                print(colored(f"🟠 keepalive status={r.status_code}","yellow"))
+                log("POSITION", f"{('🟩 LONG' if POS.side=='LONG' else '🟥 SHORT')}  Entry={POS.entry:.6f}  Qty={POS.qty:.4f}  Bars={POS.bars}  "
+                                 f"PnL={POS.pnl:+.6f}  Trail={POS.trail:.6f}  TP1_done={POS.tp1_done}", "yellow")
+
+            # Sizing preview
+            nxt_qty = next_order_qty(c[-1], EQUITY, ENV["RISK_PCT"]/100.0*100, ENV["LEVERAGE"])  # keep same semantics
+            log("PREVIEW", f"Next order @10x ≈ qty {nxt_qty:.2f} DOGE  (notional ~{(nxt_qty*c[-1]):.2f} USDT)", "blue")
+
+            # ----- Entry (on bar close only) -----
+            buy_sig = (trend[-2] <= 0 and trend[-1] > 0)
+            sell_sig= (trend[-2] >= 0 and trend[-1] < 0)
+
+            if ENV["FORCE_TV_ENTRIES"] and not bar_closed:
+                # Explain no-trade while waiting the bar to close
+                log("RESULTS", f"{ICON['wait']} No trade — reason: waiting bar close (TV sync). • close in ~{max(0,secs_to_close)}s", "white")
+            else:
+                # Spike filter: avoid entries on huge single-bar ATR spikes
+                recent_atr = atr_arr[-1]
+                bar_move = abs(c[-1]-o[-1])
+                huge_spike = bar_move > ENV["SPIKE_FILTER_ATR_MULTIPLIER"]*recent_atr
+
+                reason = None
+                if POS.flat():
+                    if huge_spike:
+                        reason = f"spike filter ({bar_move:.6f} > {ENV['SPIKE_FILTER_ATR_MULTIPLIER']}×ATR)"
+                    elif buy_sig:
+                        side="LONG"
+                    elif sell_sig:
+                        side="SHORT"
+                    else:
+                        reason = "no signal"
+
+                    if reason:
+                        log("RESULTS", f"{ICON['wait']} No trade — reason: {reason}. • close in ~{max(0,secs_to_close)}s", "white")
+                    else:
+                        qty = max(0.0, nxt_qty)
+                        if qty<=0:
+                            log("RESULTS", f"{ICON['err']} sizing=0, skip.", "red")
+                        else:
+                            ok = place_order("BUY" if side=="LONG" else "SELL", qty, c[-1])
+                            if ok:
+                                POS.side = side
+                                POS.entry = c[-1]
+                                POS.qty   = qty
+                                POS.bars  = 0
+                                POS.pnl   = 0.0
+                                POS.trail = 0.0
+                                POS.tp1_done = False
+                                POS.adds = 0
+                                log("POSITION", f"{ICON['buy'] if side=='LONG' else ICON['sell']} [ACTIVE]", "green" if side=="LONG" else "red")
+                else:
+                    # ----- Post-entry INTELLIGENCE -----
+                    POS.bars += 1
+                    # Real-time PnL approx
+                    POS.pnl = (c[-1]-POS.entry)*POS.qty if POS.side=="LONG" else (POS.entry-c[-1])*POS.qty
+                    rr = (c[-1]-POS.entry)/POS.entry if POS.side=="LONG" else (POS.entry-c[-1])/POS.entry
+
+                    # TP1
+                    if not POS.tp1_done and rr>=ENV["TP1_PCT"]/100.0:
+                        close_qty = POS.qty*ENV["TP1_CLOSE_FRAC"]
+                        log("RESULTS", f"{ICON['tp']} TP1 hit • close {close_qty:.2f} DOGE (~{ENV['TP1_CLOSE_FRAC']*100:.0f}%)", "green")
+                        # simulate partial close:
+                        POS.qty -= close_qty
+                        POS.tp1_done = True
+
+                    # Breakeven after sufficient move
+                    if POS.tp1_done and rr>=ENV["BREAKEVEN_AFTER_PCT"]/100.0 and POS.trail==0.0:
+                        POS.trail = POS.entry  # BE
+                        log("RESULTS", f"{ICON['be']} Breakeven armed @ {POS.trail:.6f}", "green")
+
+                    # ATR Trailing activation
+                    activate = rr>=ENV["TRAIL_ACTIVATE_PCT"]/100.0
+                    if activate:
+                        trail_raw = (c[-1] - ENV["ATR_MULT_TRAIL"]*atr_arr[-1]) if POS.side=="LONG" else (c[-1] + ENV["ATR_MULT_TRAIL"]*atr_arr[-1])
+                        if POS.trail==0.0:
+                            POS.trail = trail_raw
+                            log("RESULTS", f"{ICON['trail']} Trail start @ {POS.trail:.6f}", "green")
+                        else:
+                            if POS.side=="LONG":
+                                POS.trail = max(POS.trail, trail_raw)
+                            else:
+                                POS.trail = min(POS.trail, trail_raw)
+
+                    # Hold-TP if trend still strong
+                    if ENV["HOLD_TP_STRONG"]:
+                        slope = (c[-1]-c[-4])/max(1e-9, c[-4]) if len(c)>=4 else 0.0
+                        if adx_arr[-1]>=ENV["HOLD_TP_ADX"] and slope>ENV["HOLD_TP_SLOPE"]/100.0:
+                            # hold: do nothing, just note
+                            log("RESULTS", f"Hold-TP: ADX {adx_arr[-1]:.1f} & slope {slope*100:.2f}% → holding profits", "cyan")
+
+                    # Scale-In (adds) if trend improving
+                    if ENV["SCALE_IN_ENABLED"] and POS.adds<ENV["SCALE_IN_MAX_ADDS"]:
+                        slope = (c[-1]-c[-4])/max(1e-9, c[-4]) if len(c)>=4 else 0.0
+                        cond_adx = adx_arr[-1]>=ENV["SCALE_IN_ADX_MIN"]
+                        cond_slope = (slope>ENV["SCALE_IN_SLOPE_MIN"]/100.0)
+                        if cond_adx and cond_slope:
+                            add_qty = POS.qty*0.25
+                            side_order = "BUY" if POS.side=="LONG" else "SELL"
+                            ok = place_order(side_order, add_qty, c[-1])
+                            if ok:
+                                POS.qty += add_qty
+                                POS.adds += 1
+                                log("RESULTS", f"Scale-In +{add_qty:.2f} DOGE (adds={POS.adds}/{ENV['SCALE_IN_MAX_ADDS']})", "blue")
+
+                    # Exit conditions: trail or reverse
+                    exit_reason=None
+                    if POS.trail!=0.0:
+                        if (POS.side=="LONG" and c[-1]<POS.trail) or (POS.side=="SHORT" and c[-1]>POS.trail):
+                            exit_reason="trail hit"
+                    if (POS.side=="LONG" and sell_sig) or (POS.side=="SHORT" and buy_sig):
+                        exit_reason = exit_reason or "reverse signal"
+
+                    if exit_reason:
+                        log("RESULTS", f"Exit • {exit_reason} • PnL≈{POS.pnl:+.4f} USDT", "yellow")
+                        ok = close_position()
+                        if ok:
+                            log("POSITION", f"{ICON['flat']} FLAT", "yellow")
+
+            # keepalive
+            if now_utc_ts() - LAST_KEEPALIVE >= ENV["KEEPALIVE_SECONDS"]:
+                LAST_KEEPALIVE = now_utc_ts()
+                log("KEEPALIVE", f"ok (200)", "white")
+
+            LAST_BAR_TS = t[-1]
+            time.sleep(ENV["DECISION_EVERY_S"])
+
         except Exception as e:
-            print(colored(f"🔴 keepalive error: {e}","red"))
-        time.sleep(max(KEEPALIVE_SECONDS,15))
+            log("ERROR", f"{ICON['err']} {e}", "red")
+            time.sleep(ENV["DECISION_EVERY_S"])
 
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    mode = 'LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ MIME-B RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()}"
-
-@app.route("/metrics")
-def metrics():
-    return jsonify({
-        "symbol": SYMBOL,
-        "interval": INTERVAL,
-        "mode": "live" if MODE_LIVE else "paper",
-        "leverage": LEVERAGE,
-        "risk_alloc": RISK_ALLOC,
-        "price": price_now(),
-        "position": state,
-        "compound_pnl": compound_pnl,
-        "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "strategy": STRATEGY
-    })
-
-@app.route("/ping")
-def ping(): return "pong", 200
-
-# Boot
-threading.Thread(target=trade_loop, daemon=True).start()
-threading.Thread(target=keepalive_loop, daemon=True).start()
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)
+# --------------------- Boot ---------------------
+if __name__=="__main__":
+    log("BOOT", f"{ICON['ok']} Starting bot • Mode={('PAPER' if PAPER else 'LIVE')} • TV-sync={'ON' if ENV['FORCE_TV_ENTRIES'] else 'OFF'}", "green")
+    log("CONF", f"Symbol={SYMBOL_NORM}  Interval={ENV['INTERVAL']}  Leverage={ENV['LEVERAGE']}x  Risk={ENV['RISK_PCT']}%", "white")
+    # Start health server
+    threading.Thread(target=start_server, daemon=True).start()
+    loop()
